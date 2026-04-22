@@ -333,16 +333,6 @@ async fn preview_start(
                                 }
                                 PreviewSessionPhase::Failed => {
                                     let failure_message = status.failure_message.clone().expect("Failed session must have failure_message");
-                                    // Sessions that fail to spawn should not be retained —
-                                    // delete the CRD so the operator can clean up and the
-                                    // user can retry without stale resources blocking them.
-                                    if let Err(err) = delete::delete_and_finalize(api, &session.name_any(), &DeleteParams::default()).await {
-                                        subtask.warning(&format!(
-                                            "failed to delete failed session '{}': {err}, \
-                                             you may need to delete it manually or with `mirrord preview stop`",
-                                            session.name_any(),
-                                        ));
-                                    }
                                     subtask.failure(None);
                                     return Err(CliError::PreviewSessionFailed(failure_message));
                                 }
@@ -400,7 +390,8 @@ async fn preview_start(
 
 /// Handle `mirrord preview status` command.
 ///
-/// Lists preview environments, optionally filtered by key and namespace.
+/// Lists preview environments, optionally filtered by key, namespace, and whether failed
+/// sessions should be shown.
 #[tracing::instrument(level = Level::TRACE, ret, skip_all)]
 async fn preview_status(
     args: PreviewStatusArgs,
@@ -443,6 +434,32 @@ async fn preview_status(
         })?
         .items;
 
+    let sessions: Vec<_> = sessions
+        .iter()
+        .filter(|session| {
+            let Some(status) = session.status.as_ref() else {
+                return false;
+            };
+
+            // Older operators reused the `Failed` phase with a specific failure message
+            // when the preview TTL elapsed instead of deleting them, so we need to handle
+            // that to hide expired preview sessions in a backwards compatible way.
+            // See https://github.com/metalbear-co/operator/blob/17e4c645d59affefc672f597a10e2880c405f043/crates/operator-preview-env/src/task.rs#L774-L775
+            let (failed, expired) = match (status.phase, status.failure_message.as_deref()) {
+                (PreviewSessionPhase::Failed, Some("preview session TTL expired")) => (false, true),
+                (PreviewSessionPhase::Failed, _) => (true, false),
+                _ => (false, false),
+            };
+
+            if args.failed {
+                failed
+            } else {
+                // Not failed and not expired = alive
+                !failed && !expired
+            }
+        })
+        .collect();
+
     if sessions.is_empty() {
         subtask.success(Some("no preview sessions found"));
         progress.success(None);
@@ -478,7 +495,7 @@ async fn preview_status(
                 .and_then(|s| s.pod_name.as_deref())
                 .unwrap_or("<unknown>");
 
-            let status = match session.status.as_ref().map(|s| &s.phase) {
+            let status = match session.status.as_ref().map(|status| status.phase) {
                 Some(PreviewSessionPhase::Initializing) => "initializing".to_owned(),
                 Some(PreviewSessionPhase::Waiting) => "waiting".to_owned(),
                 Some(PreviewSessionPhase::Ready) => {
@@ -502,14 +519,12 @@ async fn preview_status(
                         }
                     }
                 }
-                Some(PreviewSessionPhase::Failed) => {
-                    let msg = session
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.failure_message.as_deref())
-                        .unwrap_or("unknown");
-                    format!("stopped ({msg})")
-                }
+                Some(PreviewSessionPhase::Failed) => session
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.failure_message.as_deref())
+                    .unwrap_or("unknown")
+                    .to_owned(),
                 Some(PreviewSessionPhase::Unknown) => "unknown".to_owned(),
                 None => "pending".to_owned(),
             };
@@ -537,7 +552,6 @@ async fn preview_status(
 
     Ok(())
 }
-
 /// Handle `mirrord preview stop` command.
 ///
 /// Deletes preview environments matching the given key and, optionally, a target filter and
